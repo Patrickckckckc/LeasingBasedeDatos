@@ -466,7 +466,8 @@ class ContractScreen(BaseScreen):
         buttons = ctk.CTkFrame(form, fg_color="transparent")
         buttons.grid(row=4, column=0, columnspan=4, pady=8)
         for text, command in [("Crear Contrato", self.save), ("Actualizar", self.update),
-                              ("Eliminar", self.delete), ("Buscar", self.refresh)]:
+                              ("Eliminar", self.delete), ("Buscar", self.search),
+                              ("Mostrar Todos", self.show_all)]:
             ctk.CTkButton(buttons, text=text, width=135, command=command).pack(side="left", padx=4)
 
     def _load_combo(self, key: str, query: str) -> None:
@@ -518,6 +519,22 @@ class ContractScreen(BaseScreen):
             self.info("Seleccione un contrato en la tabla.")
             return
         try:
+            _, payments = self.db.select(
+                "SELECT COUNT(*) FROM dbo.pago WHERE contrato_id=?",
+                (self.selected_id,),
+            )
+            if payments and payments[0][0] > 0:
+                self.info("No se puede eliminar el contrato porque tiene pagos asociados.")
+                return
+
+            _, registrations = self.db.select(
+                "SELECT COUNT(*) FROM dbo.matricula WHERE contrato_id=?",
+                (self.selected_id,),
+            )
+            if registrations and registrations[0][0] > 0:
+                self.info("No se puede eliminar el contrato porque tiene una matrícula asociada.")
+                return
+
             self.db.delete("DELETE FROM dbo.contrato_leasing WHERE contrato_id=?", (self.selected_id,))
             self.refresh()
         except DatabaseError as exc:
@@ -538,6 +555,49 @@ class ContractScreen(BaseScreen):
             self.table.set_rows(columns, rows)
         except DatabaseError as exc:
             self.error(exc)
+
+    def search(self) -> None:
+        filter_values = (
+            ("cl.nombre", self.combos["cliente"].get(), True),
+            ("CONCAT(v.marca,' ',v.modelo)", self.combos["vehiculo"].get(), True),
+            ("e.nombre", self.combos["empleado"].get(), True),
+            ("c.fecha_inicio", self.entries["fecha_inicio"].get().strip(), False),
+            ("c.fecha_fin", self.entries["fecha_fin"].get().strip(), False),
+            ("c.cuota_mensual", self.entries["cuota_mensual"].get().strip(), False),
+            ("c.kilometraje_permitido", self.entries["kilometraje_permitido"].get().strip(), False),
+        )
+        conditions = []
+        parameters: list[str] = []
+        for column, value, is_text_filter in filter_values:
+            if value:
+                conditions.append(f"{column} LIKE ?" if is_text_filter else f"{column} = ?")
+                parameters.append(f"%{value}%" if is_text_filter else value)
+
+        query = """SELECT c.contrato_id,cl.nombre AS cliente,
+                          CONCAT(v.marca,' ',v.modelo) AS vehiculo,e.nombre AS empleado,
+                          c.fecha_inicio,c.fecha_fin,c.cuota_mensual,c.kilometraje_permitido
+                   FROM dbo.contrato_leasing c
+                   JOIN dbo.cliente cl ON cl.cliente_id=c.cliente_id
+                   JOIN dbo.vehiculo v ON v.vehiculo_id=c.vehiculo_id
+                   JOIN dbo.empleado e ON e.empleado_id=c.empleado_id"""
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY c.contrato_id"
+
+        try:
+            columns, rows = self.db.select(query, parameters)
+            self.table.set_rows(columns, rows)
+            if not rows:
+                self.info("No se encontraron contratos.")
+        except DatabaseError as exc:
+            self.error(exc)
+
+    def show_all(self) -> None:
+        for combo in self.combos.values():
+            combo.set("")
+        for entry in self.entries.values():
+            entry.delete(0, END)
+        self.refresh()
 
     def _select_row(self, _event: object) -> None:
         values = self.table.selected_values()
