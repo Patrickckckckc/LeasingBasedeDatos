@@ -642,7 +642,8 @@ class PaymentScreen(BaseScreen):
         buttons = ctk.CTkFrame(form, fg_color="transparent")
         buttons.grid(row=2, column=0, columnspan=5, pady=8)
         for text, command in [("Registrar Pago", self.save), ("Actualizar", self.update),
-                              ("Eliminar", self.delete), ("Buscar", self.refresh)]:
+                              ("Eliminar", self.delete), ("Buscar", self.search),
+                              ("Mostrar Todos", self.show_all)]:
             ctk.CTkButton(buttons, text=text, width=135, command=command).pack(side="left", padx=4)
 
     def _load_contracts(self) -> None:
@@ -709,6 +710,51 @@ class PaymentScreen(BaseScreen):
         except DatabaseError as exc:
             self.error(exc)
 
+    def search(self) -> None:
+        conditions = []
+        parameters: list[object] = []
+        contract_value = self.contract_combo.get().strip()
+        if contract_value:
+            contract_id = self.contract_ids.get(contract_value)
+            if contract_id is None:
+                self.info("Seleccione un contrato válido.")
+                return
+            conditions.append("p.contrato_id=?")
+            parameters.append(contract_id)
+
+        for column, key, is_text_filter in [
+            ("p.monto", "monto", False),
+            ("p.fecha_pago", "fecha_pago", False),
+            ("p.metodo_pago", "metodo_pago", True),
+            ("p.estado", "estado", True),
+        ]:
+            value = self.entries[key].get().strip()
+            if value:
+                conditions.append(f"{column} LIKE ?" if is_text_filter else f"{column} = ?")
+                parameters.append(f"%{value}%" if is_text_filter else value)
+
+        query = """SELECT p.pago_id,p.contrato_id,cl.nombre AS cliente,p.monto,
+                          p.fecha_pago,p.metodo_pago,p.estado
+                   FROM dbo.pago p JOIN dbo.contrato_leasing c ON c.contrato_id=p.contrato_id
+                   JOIN dbo.cliente cl ON cl.cliente_id=c.cliente_id"""
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY p.fecha_pago DESC"
+
+        try:
+            columns, rows = self.db.select(query, parameters)
+            self.table.set_rows(columns, rows)
+            if not rows:
+                self.info("No se encontraron pagos.")
+        except DatabaseError as exc:
+            self.error(exc)
+
+    def show_all(self) -> None:
+        self.contract_combo.set("")
+        for entry in self.entries.values():
+            entry.delete(0, END)
+        self.refresh()
+
     def _select_row(self, _event: object) -> None:
         values = self.table.selected_values()
         if not values:
@@ -747,15 +793,21 @@ class MaintenanceScreen(BaseScreen):
 
 
 class ReportsScreen(BaseScreen):
-    """Displays the four reporting views created in the SQL script."""
+    """Displays the user-facing reports backed by SQL views."""
 
     def __init__(self, master: ctk.CTkBaseClass, db: DatabaseManager) -> None:
-        super().__init__(master, db, "Reportes")
-        self.view_name = ctk.StringVar(value="vw_clientes_contratos")
+        super().__init__(master, db, "Reportes disponibles")
+        self.report_views = {
+            "Reporte de Seguros de Vehículos": "vw_vehiculos_seguros",
+            "Resumen de Pagos": "vw_resumen_pagos",
+        }
+        self.report_name = ctk.StringVar(value="Reporte de Seguros de Vehículos")
+        ctk.CTkLabel(self, text="Seleccione un reporte").pack(
+            anchor="w", padx=24, pady=(0, 4)
+        )
         self.selector = ctk.CTkComboBox(
-            self, width=260, variable=self.view_name,
-            values=["vw_clientes_contratos", "vw_vehiculos_seguros",
-                    "vw_historial_mantenimiento", "vw_resumen_pagos"],
+            self, width=280, variable=self.report_name,
+            values=list(self.report_views),
             command=lambda _value: self.refresh(),
         )
         self.selector.pack(anchor="w", padx=24, pady=(0, 12))
@@ -768,8 +820,9 @@ class ReportsScreen(BaseScreen):
 
     def refresh(self) -> None:
         try:
+            view_name = self.report_views[self.report_name.get()]
             columns, rows = self.db.select(
-                f"SELECT * FROM dbo.{self.view_name.get()}"
+                f"SELECT * FROM dbo.{view_name}"
             )
             self.table.set_rows(columns, rows)
         except DatabaseError as exc:
