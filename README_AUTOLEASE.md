@@ -203,6 +203,26 @@ mantiene correctas las importaciones relativas de la aplicación.
 5. Pulse **Buscar** o **Actualizar** para recargar los datos.
 6. Abra **Reportes** y seleccione una de las vistas disponibles.
 
+Para verificar el alta de clientes:
+
+1. Abra **Clientes** y pulse **Nuevo**.
+2. Confirme que el formulario muestra **DNI, Nombre, Email, Telefono,
+   Direccion y Tipo Canal**, y que no muestra **Fecha Registro**.
+3. Intente guardar sin DNI; la aplicación debe solicitarlo y no ejecutar el
+   INSERT.
+4. Complete los campos obligatorios, guarde el cliente y confirme que aparece
+   en la tabla con su DNI.
+5. En SQL Server, compruebe que la fecha se asignó automáticamente:
+
+   ```sql
+   SELECT dni, fecha_registro
+   FROM dbo.cliente
+   WHERE dni = 'DNI_DE_PRUEBA';
+   ```
+
+   `fecha_registro` debe ser la fecha actual del servidor y no un valor
+   introducido desde la interfaz.
+
 El inicio de sesión valida el usuario y la contraseña contra
 `db_leasing_vehicular`. Después se muestran las pantallas de clientes,
 vehículos, contratos, pagos, mantenimientos y reportes. Las operaciones

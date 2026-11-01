@@ -1,6 +1,5 @@
 """Reusable CustomTkinter widgets and application screens."""
 
-from datetime import date
 from tkinter import END, messagebox, ttk
 from typing import Callable
 
@@ -131,8 +130,8 @@ class ClientScreen(BaseScreen):
         form = ctk.CTkFrame(self)
         form.pack(fill="x", padx=24, pady=(0, 12))
         fields = [
-            ("nombre", "Nombre"), ("email", "Email"), ("telefono", "Teléfono"),
-            ("direccion", "Dirección"), ("fecha_registro", "Fecha Registro"),
+            ("dni", "DNI"), ("nombre", "Nombre"), ("email", "Email"),
+            ("telefono", "Teléfono"), ("direccion", "Dirección"),
             ("tipo_canal", "Tipo Canal"),
         ]
         for index, (key, label) in enumerate(fields):
@@ -144,7 +143,8 @@ class ClientScreen(BaseScreen):
         buttons.grid(row=4, column=0, columnspan=3, pady=8)
         for text, command in [
             ("Nuevo", self.new_record), ("Guardar", self.save),
-            ("Actualizar", self.update), ("Eliminar", self.delete), ("Buscar", self.refresh),
+            ("Actualizar", self.update), ("Eliminar", self.delete),
+            ("Buscar", self.search), ("Mostrar todos", self.show_all),
         ]:
             ctk.CTkButton(buttons, text=text, width=110, command=command).pack(side="left", padx=4)
 
@@ -152,17 +152,31 @@ class ClientScreen(BaseScreen):
         self.selected_id = None
         for entry in self.entries.values():
             entry.delete(0, END)
-        self.entries["fecha_registro"].insert(0, date.today().isoformat())
 
     def values(self) -> tuple[str, ...]:
         return tuple(entry.get().strip() for entry in self.entries.values())
 
+    def _validate_values(self, values: tuple[str, ...]) -> bool:
+        required = {
+            "DNI": values[0],
+            "Nombre": values[1],
+            "Tipo Canal": values[5],
+        }
+        missing = [label for label, value in required.items() if not value]
+        if missing:
+            self.info(f"Complete los campos obligatorios: {', '.join(missing)}.")
+            return False
+        return True
+
     def save(self) -> None:
+        values = self.values()
+        if not self._validate_values(values):
+            return
         try:
             self.db.insert(
                 """INSERT INTO dbo.cliente
-                   (nombre,email,telefono,direccion,fecha_registro,tipo_canal)
-                   VALUES (?,?,?,?,?,?)""", self.values()
+                   (dni,nombre,email,telefono,direccion,tipo_canal,fecha_registro)
+                   VALUES (?,?,?,?,?,?,CAST(GETDATE() AS date))""", values
             )
             self.refresh()
             self.new_record()
@@ -173,11 +187,14 @@ class ClientScreen(BaseScreen):
         if self.selected_id is None:
             self.info("Seleccione un cliente en la tabla.")
             return
+        values = self.values()
+        if not self._validate_values(values):
+            return
         try:
             self.db.update(
-                """UPDATE dbo.cliente SET nombre=?,email=?,telefono=?,direccion=?,
-                   fecha_registro=?,tipo_canal=? WHERE cliente_id=?""",
-                self.values() + (self.selected_id,),
+                """UPDATE dbo.cliente SET dni=?,nombre=?,email=?,telefono=?,
+                   direccion=?,tipo_canal=? WHERE cliente_id=?""",
+                values + (self.selected_id,),
             )
             self.refresh()
         except DatabaseError as exc:
@@ -190,6 +207,17 @@ class ClientScreen(BaseScreen):
         if not messagebox.askyesno("Confirmar", "¿Eliminar el cliente seleccionado?", parent=self):
             return
         try:
+            self.db.update(
+                "UPDATE dbo.cliente SET conyuge_id=NULL WHERE conyuge_id=?",
+                (self.selected_id,),
+            )
+            _, contracts = self.db.select(
+                "SELECT contrato_id FROM dbo.contrato_leasing WHERE cliente_id=?",
+                (self.selected_id,),
+            )
+            if contracts:
+                self.info("No se puede eliminar el cliente porque tiene contratos asociados.")
+                return
             self.db.delete("DELETE FROM dbo.cliente WHERE cliente_id=?", (self.selected_id,))
             self.refresh()
             self.new_record()
@@ -199,12 +227,49 @@ class ClientScreen(BaseScreen):
     def refresh(self) -> None:
         try:
             columns, rows = self.db.select(
-                """SELECT cliente_id,nombre,email,telefono,direccion,fecha_registro,tipo_canal
+                """SELECT cliente_id,dni,nombre,email,telefono,direccion,tipo_canal,
+                          fecha_registro
                    FROM dbo.cliente ORDER BY cliente_id"""
             )
             self.table.set_rows(columns, rows)
         except DatabaseError as exc:
             self.error(exc)
+
+    def search(self) -> None:
+        filter_fields = (
+            ("dni", "DNI"),
+            ("nombre", "Nombre"),
+            ("email", "Email"),
+            ("telefono", "Telefono"),
+            ("direccion", "Direccion"),
+            ("tipo_canal", "Tipo Canal"),
+        )
+        values = self.values()
+        conditions = []
+        parameters: list[str] = []
+        for (column, _label), value in zip(filter_fields, values):
+            if value:
+                conditions.append(f"{column} LIKE ?")
+                parameters.append(f"%{value}%")
+
+        query = """SELECT cliente_id,dni,nombre,email,telefono,direccion,tipo_canal,
+                          fecha_registro
+                   FROM dbo.cliente"""
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY cliente_id"
+
+        try:
+            columns, rows = self.db.select(query, parameters)
+            self.table.set_rows(columns, rows)
+            if not rows:
+                self.info("No se encontraron clientes.")
+        except DatabaseError as exc:
+            self.error(exc)
+
+    def show_all(self) -> None:
+        self.new_record()
+        self.refresh()
 
     def _select_row(self, _event: object) -> None:
         values = self.table.selected_values()
@@ -243,7 +308,7 @@ class VehicleScreen(BaseScreen):
         buttons.grid(row=4, column=0, columnspan=3, pady=8)
         for text, command in [("Nuevo", self.new_record), ("Guardar", self.save),
                               ("Actualizar", self.update), ("Eliminar", self.delete),
-                              ("Buscar", self.refresh)]:
+                              ("Buscar", self.search), ("Mostrar todos", self.show_all)]:
             ctk.CTkButton(buttons, text=text, width=110, command=command).pack(side="left", padx=4)
 
     def new_record(self) -> None:
@@ -287,6 +352,13 @@ class VehicleScreen(BaseScreen):
         if not messagebox.askyesno("Confirmar", "¿Eliminar el vehículo seleccionado?", parent=self):
             return
         try:
+            _, contracts = self.db.select(
+                "SELECT COUNT(*) FROM dbo.contrato_leasing WHERE vehiculo_id=?",
+                (self.selected_id,),
+            )
+            if contracts and contracts[0][0] > 0:
+                self.info("No se puede eliminar el vehículo porque tiene contratos asociados.")
+                return
             self.db.delete("DELETE FROM dbo.vehiculo WHERE vehiculo_id=?", (self.selected_id,))
             self.refresh()
             self.new_record()
@@ -302,6 +374,47 @@ class VehicleScreen(BaseScreen):
             self.table.set_rows(columns, rows)
         except DatabaseError as exc:
             self.error(exc)
+
+    def search(self) -> None:
+        filter_fields = (
+            ("marca", "Marca"),
+            ("modelo", "Modelo"),
+            ("anio", "Año"),
+            ("precio", "Precio"),
+            ("color", "Color"),
+            ("kilometraje_actual", "Kilometraje Actual"),
+        )
+        values = self.values()
+        conditions = []
+        parameters: list[str] = []
+        for (column, _label), value in zip(filter_fields, values):
+            if value:
+                searchable_column = (
+                    f"CAST({column} AS VARCHAR(50))"
+                    if column in {"anio", "precio", "kilometraje_actual"}
+                    else column
+                )
+                conditions.append(f"{searchable_column} LIKE ?")
+                parameters.append(f"%{value}%")
+
+        query = """SELECT vehiculo_id,marca,modelo,anio,precio,color,kilometraje_actual
+                   FROM dbo.vehiculo"""
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY vehiculo_id"
+
+        try:
+            columns, rows = self.db.select(query, parameters)
+            self.table.set_rows(columns, rows)
+            if not rows:
+                self.info("No se encontraron vehículos.")
+        except DatabaseError as exc:
+            self.error(exc)
+
+    def show_all(self) -> None:
+        self.new_record()
+        self.refresh()
+
 
     def _select_row(self, _event: object) -> None:
         values = self.table.selected_values()
