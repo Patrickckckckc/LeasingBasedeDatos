@@ -698,3 +698,104 @@ en la seccion 8.5. De esta manera, VS Code proporciona una interfaz para
 desarrollar y verificar el sistema, mientras SQL Server Express procesa
 las instrucciones y administra la informacion almacenada.
 ====================================================================== */
+
+/*
+ =====================================================================
+   8.7 SEGURIDAD 
+   ===================================================================== */
+USE db_leasing_vehicular;
+GO
+
+/* =====================  8.7.1 Exportar / importar  ===================== */
+/* (a) Exportar estructura y datos como script (desde SSMS):
+       clic derecho sobre la BD > Tasks > Generate Scripts >
+       "Types of data to script" = Schema and data.
+   (b) Exportar una tabla a archivo, desde PowerShell
+       (se usa tabulador porque las direcciones contienen comas):
+       bcp db_leasing_vehicular.dbo.cliente out C:\Backups\cliente.txt -S .\SQLEXPRESS -T -c -u
+       (si su bcp no reconoce -u, quitarlo)
+   (c) Importar el script completo, desde PowerShell:
+       sqlcmd -S .\SQLEXPRESS -E -C -i .\db_leasing_vehicular.sql                    */
+
+-- (d) Importar el archivo a una tabla con la misma estructura
+
+-- Crear la carpeta de respaldos si no existe
+EXEC master.sys.xp_create_subdir 'C:\Backups';
+GO
+SELECT * INTO dbo.cliente_importacion FROM dbo.cliente WHERE 1 = 0;
+GO
+BULK INSERT dbo.cliente_importacion
+FROM 'C:\Backups\cliente.txt'
+WITH (KEEPIDENTITY, KEEPNULLS);
+GO
+SELECT * FROM dbo.cliente_importacion;     -- comprobar la importacion
+GO
+DROP TABLE dbo.cliente_importacion;        -- limpiar la tabla de prueba
+GO
+
+/* =====================  8.7.2 Realizar back up  ===================== */
+-- Respaldo completo
+BACKUP DATABASE db_leasing_vehicular
+TO DISK = 'C:\Backups\db_leasing_vehicular_full.bak'
+WITH FORMAT, INIT, NAME = 'Respaldo completo AutoLease', CHECKSUM, STATS = 10;
+GO
+
+-- Respaldo diferencial (solo cambios desde el ultimo completo)
+BACKUP DATABASE db_leasing_vehicular
+TO DISK = 'C:\Backups\db_leasing_vehicular_diff.bak'
+WITH DIFFERENTIAL, INIT, NAME = 'Diferencial AutoLease', CHECKSUM, STATS = 10;
+GO
+
+-- Verificar que el respaldo es legible
+RESTORE VERIFYONLY
+FROM DISK = 'C:\Backups\db_leasing_vehicular_full.bak' WITH CHECKSUM;
+GO
+
+-- Restaurar (solo si se necesita recuperar la base; primero el completo)
+/*
+USE master;
+ALTER DATABASE db_leasing_vehicular SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+RESTORE DATABASE db_leasing_vehicular
+FROM DISK = 'C:\Backups\db_leasing_vehicular_full.bak' WITH REPLACE, STATS = 10;
+ALTER DATABASE db_leasing_vehicular SET MULTI_USER;
+*/
+GO
+
+/* =====================  8.7.4 Politicas de seguridad  ===================== */
+-- Minimo privilegio y separacion de funciones con un ROL de consulta
+IF DATABASE_PRINCIPAL_ID('rol_asesor') IS NULL
+    CREATE ROLE rol_asesor;
+GO
+GRANT SELECT ON dbo.cliente               TO rol_asesor;
+GRANT SELECT ON dbo.vw_clientes_contratos TO rol_asesor;
+GRANT SELECT ON dbo.vw_resumen_pagos      TO rol_asesor;
+ALTER ROLE rol_asesor ADD MEMBER estudiante1;
+GO
+
+-- Politica de contrasenas: complejidad y expiracion para el login
+USE master;
+GO
+ALTER LOGIN estudiante1 WITH CHECK_POLICY = ON, CHECK_EXPIRATION = ON;
+GO
+
+-- Comprobar roles y permisos aplicados
+USE db_leasing_vehicular;
+GO
+SELECT dp.name AS usuario_o_rol, p.permission_name, p.state_desc, OBJECT_NAME(p.major_id) AS objeto
+FROM sys.database_permissions p
+INNER JOIN sys.database_principals dp ON dp.principal_id = p.grantee_principal_id
+WHERE dp.name IN ('estudiante1', 'rol_asesor') AND p.major_id > 0
+ORDER BY dp.name, objeto;
+GO
+
+/* =====================  8.7.5 Vulnerabilidad: inyeccion SQL  ===================== */
+DECLARE @dni VARCHAR(50) = ''' OR 1=1 --';   -- entrada maliciosa
+
+-- VULNERABLE: concatena la entrada -> devuelve TODOS los clientes
+EXEC('SELECT cliente_id, nombre, dni FROM cliente WHERE dni = ''' + @dni + '''');
+
+-- SEGURO: consulta parametrizada -> no devuelve filas
+EXEC sp_executesql
+     N'SELECT cliente_id, nombre, dni FROM cliente WHERE dni = @d',
+     N'@d VARCHAR(50)', @d = @dni;
+GO
