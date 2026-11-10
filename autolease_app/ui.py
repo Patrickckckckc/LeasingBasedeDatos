@@ -1,8 +1,9 @@
 """Reusable CustomTkinter widgets and application screens."""
 
+import csv
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-from tkinter import END, messagebox, ttk
+from tkinter import END, filedialog, messagebox, ttk
 from typing import Callable
 
 import customtkinter as ctk
@@ -13,32 +14,84 @@ from payment_schedule import Contract, Payment, PaymentRow, build_payment_rows, 
 
 
 class DataTable(ctk.CTkFrame):
-    """A themed Treeview that displays database rows."""
+    """A themed Treeview that displays database rows with dynamic column sizing and scrollbars."""
 
     def __init__(self, master: ctk.CTkBaseClass, **kwargs: object) -> None:
         super().__init__(master, **kwargs)
-        self.tree = ttk.Treeview(self, show="headings")
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree = ttk.Treeview(self, show="headings", selectmode="browse")
+        v_scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        h_scrollbar = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        v_scrollbar.grid(row=0, column=1, sticky="ns")
+        h_scrollbar.grid(row=1, column=0, sticky="ew")
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
+
+    @staticmethod
+    def _column_alignment(column_name: str) -> str:
+        col = column_name.lower()
+        if any(term in col for term in ("monto", "precio", "costo", "cuota", "total", "cantidad", "kilometraje", "salario", "saldo")):
+            return "e"
+        if any(col == term or col.endswith(f"_{term}") for term in ("id", "dni", "ruc", "anio", "estado")):
+            return "center"
+        if "fecha" in col or "estado" in col:
+            return "center"
+        return "w"
 
     def set_rows(self, columns: list[str], rows: list[tuple[object, ...]]) -> None:
         self.tree.delete(*self.tree.get_children())
         self.tree["columns"] = columns
-        for column in columns:
-            self.tree.heading(column, text=column.replace("_", " ").title())
-            self.tree.column(column, width=125, minwidth=80, anchor="w")
+
+        for idx, column in enumerate(columns):
+            header_text = column.replace("_", " ").title()
+
+            max_char_len = len(header_text)
+            for row in rows[:150]:
+                if idx < len(row) and row[idx] is not None:
+                    max_char_len = max(max_char_len, len(str(row[idx])))
+
+            calc_width = max(max_char_len * 9 + 28, 90)
+            calc_width = min(calc_width, 360)
+
+            align = self._column_alignment(column)
+            self.tree.heading(
+                column,
+                text=header_text,
+                command=lambda c=column: self._sort_by_column(c, False),
+            )
+            self.tree.column(column, width=calc_width, minwidth=75, anchor=align)
+
         for row in rows:
-            self.tree.insert("", END, values=[str(value) if value is not None else "" for value in row])
+            formatted_row = [
+                "-" if value is None or str(value).strip() == "" else str(value)
+                for value in row
+            ]
+            self.tree.insert("", END, values=formatted_row)
+
+    def _sort_by_column(self, col: str, reverse: bool) -> None:
+        items = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
+
+        def _sort_key(item: tuple[str, str]) -> tuple[int, object]:
+            val = item[0]
+            cleaned = val.replace("S/", "").replace("$", "").replace(",", "").strip()
+            try:
+                return (0, float(cleaned))
+            except ValueError:
+                return (1, val.lower())
+
+        items.sort(key=_sort_key, reverse=reverse)
+
+        for index, (_val, k) in enumerate(items):
+            self.tree.move(k, "", index)
+
+        self.tree.heading(col, command=lambda: self._sort_by_column(col, not reverse))
 
     def selected_values(self) -> tuple[str, ...] | None:
         selected = self.tree.selection()
         if not selected:
             return None
-        return tuple(str(value) for value in self.tree.item(selected[0], "values"))
+        return tuple("" if str(value) == "-" else str(value) for value in self.tree.item(selected[0], "values"))
 
 
 class BaseScreen(ctk.CTkFrame):
@@ -1156,37 +1209,326 @@ class MaintenanceScreen(BaseScreen):
 
 
 class ReportsScreen(BaseScreen):
-    """Displays the user-facing reports backed by SQL views."""
+    """Displays user-facing reports backed by SQL views and tables with KPI summaries."""
 
     def __init__(self, master: ctk.CTkBaseClass, db: DatabaseManager) -> None:
-        super().__init__(master, db, "Reportes disponibles")
-        self.report_views = {
-            "Reporte de Seguros de Vehículos": "vw_vehiculos_seguros",
-            "Resumen de Pagos": "vw_resumen_pagos",
+        super().__init__(master, db, "Reportes del Sistema")
+        self.report_configs: dict[str, dict[str, str]] = {
+            "Resumen de Pagos": {
+                "query": """SELECT c.contrato_id,
+                                   COALESCE(cl.nombre, 'Sin cliente asignado') AS cliente,
+                                   COALESCE(cl.dni, '-') AS dni,
+                                   CONCAT(v.marca, ' ', v.modelo) AS vehiculo,
+                                   c.cuota_mensual,
+                                   rp.cantidad_pagos,
+                                   rp.total_pagado,
+                                   CASE 
+                                       WHEN (c.cuota_mensual * NULLIF(DATEDIFF(month, c.fecha_inicio, c.fecha_fin), 0)) > rp.total_pagado 
+                                       THEN (c.cuota_mensual * DATEDIFF(month, c.fecha_inicio, c.fecha_fin)) - rp.total_pagado 
+                                       ELSE 0 
+                                   END AS saldo_pendiente,
+                                   CASE 
+                                       WHEN rp.cantidad_pagos = 0 THEN 'Sin pagos'
+                                       WHEN rp.total_pagado >= (c.cuota_mensual * DATEDIFF(month, c.fecha_inicio, c.fecha_fin)) THEN 'Completado'
+                                       ELSE 'En curso'
+                                   END AS estado_pago,
+                                   c.fecha_inicio,
+                                   c.fecha_fin
+                            FROM dbo.vw_resumen_pagos rp
+                            JOIN dbo.contrato_leasing c ON c.contrato_id = rp.contrato_id
+                            LEFT JOIN dbo.cliente cl ON cl.cliente_id = c.cliente_id
+                            LEFT JOIN dbo.vehiculo v ON v.vehiculo_id = c.vehiculo_id
+                            ORDER BY c.contrato_id""",
+                "type": "resumen_pagos",
+            },
+            "Resumen Consolidado de Pagos y Clientes": {
+                "query": """SELECT cl.nombre AS cliente, cl.dni, c.contrato_id,
+                                   c.cuota_mensual, rp.cantidad_pagos, rp.total_pagado,
+                                   c.fecha_inicio, c.fecha_fin
+                            FROM dbo.vw_resumen_pagos rp
+                            JOIN dbo.contrato_leasing c ON c.contrato_id = rp.contrato_id
+                            JOIN dbo.cliente cl ON cl.cliente_id = c.cliente_id
+                            ORDER BY cl.nombre, c.contrato_id""",
+                "type": "consolidado",
+            },
+            "Clientes y sus Contratos": {
+                "query": "SELECT * FROM dbo.vw_clientes_contratos ORDER BY cliente, contrato_id",
+                "type": "clientes_contratos",
+            },
+            "Reporte de Seguros de Vehículos": {
+                "query": "SELECT * FROM dbo.vw_vehiculos_seguros ORDER BY marca, modelo",
+                "type": "vehiculos_seguros",
+            },
+            "Historial de Mantenimientos": {
+                "query": "SELECT * FROM dbo.vw_historial_mantenimiento ORDER BY fecha DESC",
+                "type": "mantenimiento",
+            },
         }
-        self.report_name = ctk.StringVar(value="Reporte de Seguros de Vehículos")
-        ctk.CTkLabel(self, text="Seleccione un reporte").pack(
-            anchor="w", padx=24, pady=(0, 4)
-        )
-        self.selector = ctk.CTkComboBox(
-            self, width=280, variable=self.report_name,
-            values=list(self.report_views),
-            command=lambda _value: self.refresh(),
-        )
-        self.selector.pack(anchor="w", padx=24, pady=(0, 12))
-        ctk.CTkButton(self, text="Actualizar reporte", width=150, command=self.refresh).pack(
-            anchor="w", padx=24, pady=(0, 12)
-        )
-        self.table = DataTable(self)
-        self.table.pack(fill="both", expand=True, padx=24, pady=(0, 24))
+        self.report_views = {
+            "Resumen de Pagos": "vw_resumen_pagos",
+            "Reporte de Seguros de Vehículos": "vw_vehiculos_seguros",
+            "Clientes y sus Contratos": "vw_clientes_contratos",
+            "Historial de Mantenimientos": "vw_historial_mantenimiento",
+            "Resumen Consolidado de Pagos y Clientes": "vw_resumen_pagos",
+        }
+        self.report_name = ctk.StringVar(value="Resumen de Pagos")
+        self.search_var = ctk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._apply_filter())
+
+        self._all_columns: list[str] = []
+        self._all_rows: list[tuple[object, ...]] = []
+        self._current_columns: list[str] = []
+        self._current_rows: list[tuple[object, ...]] = []
+
+        self._build_controls()
+        self._build_kpi_cards()
+        self._build_table()
         self.refresh()
 
-    def refresh(self) -> None:
-        try:
-            view_name = self.report_views[self.report_name.get()]
-            columns, rows = self.db.select(
-                f"SELECT * FROM dbo.{view_name}"
+    def _build_controls(self) -> None:
+        control_frame = ctk.CTkFrame(self, fg_color="transparent")
+        control_frame.pack(fill="x", padx=24, pady=(0, 10))
+
+        top_row = ctk.CTkFrame(control_frame, fg_color="transparent")
+        top_row.pack(fill="x", pady=(0, 8))
+
+        ctk.CTkLabel(top_row, text="Reporte:", font=ctk.CTkFont(weight="bold")).pack(
+            side="left", padx=(0, 8)
+        )
+        self.selector = ctk.CTkComboBox(
+            top_row,
+            width=330,
+            variable=self.report_name,
+            values=list(self.report_configs),
+            command=lambda _val: self.refresh(),
+        )
+        self.selector.pack(side="left", padx=(0, 12))
+
+        ctk.CTkButton(
+            top_row,
+            text="Actualizar reporte",
+            width=135,
+            command=self.refresh,
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            top_row,
+            text="Exportar CSV",
+            width=120,
+            fg_color="#047857",
+            hover_color="#065f46",
+            command=self.export_csv,
+        ).pack(side="left")
+
+        filter_row = ctk.CTkFrame(control_frame, fg_color="transparent")
+        filter_row.pack(fill="x")
+
+        ctk.CTkLabel(filter_row, text="Buscar:", font=ctk.CTkFont(weight="bold")).pack(
+            side="left", padx=(0, 8)
+        )
+        self.search_entry = ctk.CTkEntry(
+            filter_row,
+            placeholder_text="Filtrar datos por cliente, ID, fecha, estado...",
+            textvariable=self.search_var,
+            width=330,
+        )
+        self.search_entry.pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            filter_row,
+            text="Limpiar",
+            width=80,
+            fg_color="transparent",
+            border_width=1,
+            command=lambda: self.search_var.set(""),
+        ).pack(side="left", padx=(0, 16))
+
+        self.status_label = ctk.CTkLabel(
+            filter_row,
+            text="",
+            text_color="#9ca3af",
+            font=ctk.CTkFont(size=12),
+        )
+        self.status_label.pack(side="left")
+
+    def _build_kpi_cards(self) -> None:
+        self.kpi_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.kpi_container.pack(fill="x", padx=24, pady=(0, 12))
+
+        self.kpi_labels: list[tuple[ctk.CTkLabel, ctk.CTkLabel]] = []
+        for i in range(4):
+            card = ctk.CTkFrame(
+                self.kpi_container,
+                corner_radius=10,
+                border_width=1,
+                border_color=("#e5e7eb", "#374151"),
+                fg_color=("#ffffff", "#1e293b"),
             )
-            self.table.set_rows(columns, rows)
+            card.pack(side="left", fill="both", expand=True, padx=(0 if i == 0 else 8, 0))
+
+            title_lbl = ctk.CTkLabel(
+                card,
+                text="--",
+                font=ctk.CTkFont(size=11),
+                text_color="#9ca3af",
+            )
+            title_lbl.pack(anchor="w", padx=14, pady=(10, 2))
+
+            val_lbl = ctk.CTkLabel(
+                card,
+                text="--",
+                font=ctk.CTkFont(size=18, weight="bold"),
+                text_color=("#111827", "#f9fafb"),
+            )
+            val_lbl.pack(anchor="w", padx=14, pady=(0, 10))
+
+            self.kpi_labels.append((title_lbl, val_lbl))
+
+    def _build_table(self) -> None:
+        self.table = DataTable(self)
+        self.table.pack(fill="both", expand=True, padx=24, pady=(0, 24))
+
+    def _update_kpis(self, rows: list[tuple[object, ...]]) -> None:
+        report_key = self.report_name.get()
+        config = self.report_configs.get(report_key, {})
+        rtype = config.get("type", "")
+
+        def _to_float(val: object) -> float:
+            try:
+                return float(str(val).replace("S/", "").replace("$", "").replace(",", "").strip())
+            except (ValueError, TypeError):
+                return 0.0
+
+        def _to_int(val: object) -> int:
+            try:
+                return int(float(str(val).replace(",", "").strip()))
+            except (ValueError, TypeError):
+                return 0
+
+        count = len(rows)
+
+        if rtype == "resumen_pagos":
+            # Columns: contrato_id, cliente, dni, vehiculo, cuota_mensual, cantidad_pagos, total_pagado, saldo_pendiente, estado_pago, fecha_inicio, fecha_fin
+            total_pagos = sum(_to_int(row[5]) for row in rows if len(row) > 5)
+            total_recaudado = sum(_to_float(row[6]) for row in rows if len(row) > 6)
+            con_pagos = sum(1 for row in rows if len(row) > 5 and _to_int(row[5]) > 0)
+            sin_pagos = count - con_pagos
+            cards_data = [
+                ("Total Contratos", f"{count}"),
+                ("Total Recaudado", f"S/ {total_recaudado:,.2f}"),
+                ("Con Pagos Registrados", f"{con_pagos} contratos ({total_pagos} pagos)"),
+                ("Sin Pagos (Vacíos / Pend.)", f"{sin_pagos} contratos"),
+            ]
+        elif rtype == "consolidado":
+            unique_clients = len({row[0] for row in rows if row and row[0] and row[0] != "-"})
+            total_pagos = sum(_to_int(row[4]) for row in rows if len(row) > 4)
+            total_recaudado = sum(_to_float(row[5]) for row in rows if len(row) > 5)
+            sin_pagos = sum(1 for row in rows if len(row) > 4 and _to_int(row[4]) == 0)
+            cards_data = [
+                ("Contratos Asociados", f"{count}"),
+                ("Clientes Únicos", f"{unique_clients}"),
+                ("Total Recaudado", f"S/ {total_recaudado:,.2f}"),
+                ("Contratos Sin Pagos", f"{sin_pagos}"),
+            ]
+        elif rtype == "clientes_contratos":
+            unique_clients = len({row[0] for row in rows if row and row[0]})
+            total_cuotas = sum(_to_float(row[4]) for row in rows if len(row) > 4)
+            cuota_prom = (total_cuotas / count) if count > 0 else 0.0
+            cards_data = [
+                ("Total Contratos", f"{count}"),
+                ("Clientes Registrados", f"{unique_clients}"),
+                ("Cuota Mensual Promedio", f"S/ {cuota_prom:,.2f}"),
+                ("Suma Cuotas Mensuales", f"S/ {total_cuotas:,.2f}"),
+            ]
+        elif rtype == "vehiculos_seguros":
+            unique_insurers = len({row[2] for row in rows if len(row) > 2 and row[2]})
+            unique_brands = len({row[0] for row in rows if len(row) > 0 and row[0]})
+            cards_data = [
+                ("Vehículos Asegurados", f"{count}"),
+                ("Aseguradoras Aliadas", f"{unique_insurers}"),
+                ("Marcas de Vehículos", f"{unique_brands}"),
+                ("Pólizas Registradas", f"{count}"),
+            ]
+        elif rtype == "mantenimiento":
+            total_costo = sum(_to_float(row[4]) for row in rows if len(row) > 4)
+            costo_prom = (total_costo / count) if count > 0 else 0.0
+            completados = sum(
+                1 for row in rows
+                if len(row) > 5 and str(row[5]).strip().lower() in ("completado", "finalizado", "realizado")
+            )
+            cards_data = [
+                ("Total Servicios", f"{count}"),
+                ("Costo Total Mantenimiento", f"S/ {total_costo:,.2f}"),
+                ("Costo Promedio", f"S/ {costo_prom:,.2f}"),
+                ("Servicios Completados", f"{completados}"),
+            ]
+        else:
+            cards_data = [
+                ("Total Registros", f"{count}"),
+                ("--", "--"),
+                ("--", "--"),
+                ("--", "--"),
+            ]
+
+        for i, (title, val) in enumerate(cards_data):
+            if i < len(self.kpi_labels):
+                self.kpi_labels[i][0].configure(text=title)
+                self.kpi_labels[i][1].configure(text=val)
+
+    def refresh(self) -> None:
+        report_key = self.report_name.get()
+        config = self.report_configs.get(report_key)
+        if not config:
+            return
+        try:
+            columns, rows = self.db.select(config["query"])
+            self._all_columns = columns
+            self._all_rows = rows
+            self._apply_filter()
         except DatabaseError as exc:
+            self.error(exc)
+
+    def _apply_filter(self) -> None:
+        search_text = self.search_var.get().strip().lower()
+        if not search_text:
+            filtered = self._all_rows
+        else:
+            filtered = [
+                row for row in self._all_rows
+                if any(search_text in str(val).lower() for val in row if val is not None)
+            ]
+        self._current_columns = self._all_columns
+        self._current_rows = filtered
+        self.table.set_rows(self._all_columns, filtered)
+        self._update_kpis(filtered)
+        if search_text:
+            self.status_label.configure(
+                text=f"Mostrando {len(filtered)} de {len(self._all_rows)} registros"
+            )
+        else:
+            self.status_label.configure(
+                text=f"Total: {len(self._all_rows)} registros"
+            )
+
+    def export_csv(self) -> None:
+        if not self._current_rows:
+            self.info("No hay datos disponibles para exportar.")
+            return
+        file_path = filedialog.asksaveasfilename(
+            parent=self,
+            defaultextension=".csv",
+            filetypes=[("Archivos CSV (*.csv)", "*.csv"), ("Todos los archivos", "*.*")],
+            title="Exportar reporte a CSV",
+            initialfile=f"reporte_{self.report_name.get().lower().replace(' ', '_')}.csv",
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow([c.replace("_", " ").title() for c in self._current_columns])
+                for row in self._current_rows:
+                    writer.writerow([str(v) if v is not None else "" for v in row])
+            self.info(f"Reporte exportado exitosamente con {len(self._current_rows)} filas.")
+        except Exception as exc:
             self.error(exc)
