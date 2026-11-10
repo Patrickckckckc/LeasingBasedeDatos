@@ -1,11 +1,15 @@
 """Reusable CustomTkinter widgets and application screens."""
 
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from tkinter import END, messagebox, ttk
 from typing import Callable
 
 import customtkinter as ctk
 
 from database import DatabaseError, DatabaseManager
+from maintenance_schedule import quarterly_dates
+from payment_schedule import Contract, Payment, PaymentRow, build_payment_rows, paid_total
 
 
 class DataTable(ctk.CTkFrame):
@@ -620,7 +624,22 @@ class PaymentScreen(BaseScreen):
         self.contract_ids: dict[str, int] = {}
         self.contract_combo: ctk.CTkComboBox
         self.entries: dict[str, ctk.CTkEntry] = {}
+        self.contracts: list[Contract] = []
+        self.payments: list[Payment] = []
+        self.rows: list[PaymentRow] = []
+        self.table_rows: dict[str, PaymentRow] = {}
         self._build_form()
+        summary = ctk.CTkFrame(self)
+        summary.pack(fill="x", padx=24, pady=(0, 12))
+        self.summary_label = ctk.CTkLabel(
+            summary, text="Seleccione un contrato para ver su resumen financiero.",
+            anchor="w",
+        )
+        self.summary_label.pack(fill="x", padx=12, pady=10)
+        ctk.CTkLabel(
+            self, text="Cuotas estimadas desde el inicio del contrato; seleccione una fila para gestionarla.",
+            anchor="w",
+        ).pack(fill="x", padx=24, pady=(0, 6))
         self.table = DataTable(self)
         self.table.pack(fill="both", expand=True, padx=24, pady=(0, 24))
         self.table.tree.bind("<<TreeviewSelect>>", self._select_row)
@@ -630,9 +649,12 @@ class PaymentScreen(BaseScreen):
         form = ctk.CTkFrame(self)
         form.pack(fill="x", padx=24, pady=(0, 12))
         ctk.CTkLabel(form, text="Contrato").grid(row=0, column=0, padx=10, pady=(10, 2), sticky="w")
-        self.contract_combo = ctk.CTkComboBox(form, width=190, values=[])
+        self.contract_combo = ctk.CTkComboBox(
+            form, width=190, values=[], command=self._contract_changed
+        )
         self.contract_combo.grid(row=1, column=0, padx=10, pady=(0, 8))
-        self._load_contracts()
+        self.contract_combo.set("")
+        self.contract_combo.bind("<KeyRelease>", self._contract_changed)
         fields = [("monto", "Monto"), ("fecha_pago", "Fecha Pago"), ("metodo_pago", "Método Pago"), ("estado", "Estado")]
         for index, (key, label) in enumerate(fields, start=1):
             ctk.CTkLabel(form, text=label).grid(row=0, column=index, padx=10, pady=(10, 2), sticky="w")
@@ -645,17 +667,6 @@ class PaymentScreen(BaseScreen):
                               ("Eliminar", self.delete), ("Buscar", self.search),
                               ("Mostrar Todos", self.show_all)]:
             ctk.CTkButton(buttons, text=text, width=135, command=command).pack(side="left", padx=4)
-
-    def _load_contracts(self) -> None:
-        try:
-            _, rows = self.db.select(
-                """SELECT c.contrato_id, CONCAT(c.contrato_id,' - ',cl.nombre)
-                   FROM dbo.contrato_leasing c JOIN dbo.cliente cl ON cl.cliente_id=c.cliente_id"""
-            )
-            self.contract_ids = {str(row[1]): int(row[0]) for row in rows}
-            self.contract_combo.configure(values=list(self.contract_ids))
-        except DatabaseError as exc:
-            self.error(exc)
 
     def _contract_id(self) -> int:
         value = self.contract_ids.get(self.contract_combo.get())
@@ -700,53 +711,98 @@ class PaymentScreen(BaseScreen):
 
     def refresh(self) -> None:
         try:
-            columns, rows = self.db.select(
-                """SELECT p.pago_id,p.contrato_id,cl.nombre AS cliente,p.monto,
-                   p.fecha_pago,p.metodo_pago,p.estado
-                   FROM dbo.pago p JOIN dbo.contrato_leasing c ON c.contrato_id=p.contrato_id
-                   JOIN dbo.cliente cl ON cl.cliente_id=c.cliente_id ORDER BY p.fecha_pago DESC"""
-            )
-            self.table.set_rows(columns, rows)
+            self._load_data()
+            self._display_rows(self.rows)
         except DatabaseError as exc:
             self.error(exc)
 
+    def _load_data(self) -> None:
+        _, contract_rows = self.db.select(
+            """SELECT c.contrato_id,cl.nombre,c.fecha_inicio,c.fecha_fin,
+                      c.cuota_mensual,v.precio
+               FROM dbo.contrato_leasing c
+               JOIN dbo.cliente cl ON cl.cliente_id=c.cliente_id
+               JOIN dbo.vehiculo v ON v.vehiculo_id=c.vehiculo_id
+               ORDER BY c.contrato_id"""
+        )
+        _, payment_rows = self.db.select(
+            """SELECT pago_id,contrato_id,monto,fecha_pago,metodo_pago,estado
+               FROM dbo.pago ORDER BY contrato_id,fecha_pago,pago_id"""
+        )
+        self.contracts = [Contract(*row) for row in contract_rows]
+        self.payments = [Payment(*row) for row in payment_rows]
+        self.rows = build_payment_rows(self.contracts, self.payments, date.today())
+        self.contract_ids = {
+            f"{contract.contract_id} - {contract.client}": contract.contract_id
+            for contract in self.contracts
+        }
+        self.contract_combo.configure(values=list(self.contract_ids))
+        self._update_summary()
+
+    def _display_rows(self, rows: list[PaymentRow]) -> None:
+        self.selected_id = None
+        self.table.set_rows(
+            ["cliente", "fecha_pago", "monto", "metodo_pago", "estado"],
+            [
+                (row.contract.client, row.payment_date.strftime("%d/%m/%Y"),
+                 f"S/ {row.amount:,.2f}",
+                 row.payment.method if row.payment else "Sin registrar", row.status)
+                for row in rows
+            ],
+        )
+        self.table_rows = dict(zip(self.table.tree.get_children(), rows))
+
+    def _contract_changed(self, _value: object) -> None:
+        self._update_summary()
+
+    def _update_summary(self) -> None:
+        contract_id = self.contract_ids.get(self.contract_combo.get())
+        contract = next((item for item in self.contracts if item.contract_id == contract_id), None)
+        if contract is None:
+            self.summary_label.configure(text="Seleccione un contrato para ver su resumen financiero.")
+            return
+        total = paid_total(contract.contract_id, self.payments)
+        self.summary_label.configure(
+            text=(f"Contrato {contract.contract_id}  |  Precio del vehículo: S/ {contract.vehicle_price:,.2f}"
+                  f"  |  Total pagado: S/ {total:,.2f}"
+                  f"  |  Saldo pendiente: S/ {contract.vehicle_price - total:,.2f}")
+        )
+
     def search(self) -> None:
-        conditions = []
-        parameters: list[object] = []
-        contract_value = self.contract_combo.get().strip()
-        if contract_value:
-            contract_id = self.contract_ids.get(contract_value)
-            if contract_id is None:
-                self.info("Seleccione un contrato válido.")
-                return
-            conditions.append("p.contrato_id=?")
-            parameters.append(contract_id)
-
-        for column, key, is_text_filter in [
-            ("p.monto", "monto", False),
-            ("p.fecha_pago", "fecha_pago", False),
-            ("p.metodo_pago", "metodo_pago", True),
-            ("p.estado", "estado", True),
-        ]:
-            value = self.entries[key].get().strip()
-            if value:
-                conditions.append(f"{column} LIKE ?" if is_text_filter else f"{column} = ?")
-                parameters.append(f"%{value}%" if is_text_filter else value)
-
-        query = """SELECT p.pago_id,p.contrato_id,cl.nombre AS cliente,p.monto,
-                          p.fecha_pago,p.metodo_pago,p.estado
-                   FROM dbo.pago p JOIN dbo.contrato_leasing c ON c.contrato_id=p.contrato_id
-                   JOIN dbo.cliente cl ON cl.cliente_id=c.cliente_id"""
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY p.fecha_pago DESC"
-
         try:
-            columns, rows = self.db.select(query, parameters)
-            self.table.set_rows(columns, rows)
+            contract_value = self.contract_combo.get().strip()
+            if contract_value and contract_value not in self.contract_ids:
+                raise ValueError("Seleccione un contrato válido.")
+            amount_text = self.entries["monto"].get().strip()
+            date_text = self.entries["fecha_pago"].get().strip()
+            try:
+                amount = Decimal(amount_text) if amount_text else None
+                if amount is not None and not amount.is_finite():
+                    raise ValueError
+                payment_date = None
+                if date_text:
+                    try:
+                        payment_date = date.fromisoformat(date_text)
+                    except ValueError:
+                        payment_date = datetime.strptime(date_text, "%d/%m/%Y").date()
+            except (InvalidOperation, ValueError):
+                raise ValueError("Ingrese un monto válido y una fecha AAAA-MM-DD o DD/MM/AAAA.")
+            method = self.entries["metodo_pago"].get().strip().casefold()
+            status = self.entries["estado"].get().strip().casefold()
+            self._load_data()
+            contract_id = self.contract_ids.get(contract_value)
+            rows = [
+                row for row in self.rows
+                if (not contract_value or row.contract.contract_id == contract_id)
+                and (amount is None or row.amount == amount)
+                and (payment_date is None or row.payment_date == payment_date)
+                and (not method or (row.payment is not None and method in row.payment.method.casefold()))
+                and (not status or status in row.status.casefold())
+            ]
+            self._display_rows(rows)
             if not rows:
                 self.info("No se encontraron pagos.")
-        except DatabaseError as exc:
+        except (DatabaseError, ValueError) as exc:
             self.error(exc)
 
     def show_all(self) -> None:
@@ -756,40 +812,347 @@ class PaymentScreen(BaseScreen):
         self.refresh()
 
     def _select_row(self, _event: object) -> None:
-        values = self.table.selected_values()
-        if not values:
+        selection = self.table.tree.selection()
+        row = self.table_rows.get(selection[0]) if selection else None
+        if row is None:
             return
-        self.selected_id = int(values[0])
-        contract = next((name for name, value in self.contract_ids.items() if str(value) == values[1]), "")
+        self.selected_id = row.payment.payment_id if row.payment else None
+        contract = next(
+            (name for name, value in self.contract_ids.items() if value == row.contract.contract_id), ""
+        )
         self.contract_combo.set(contract)
-        for entry, value in zip(self.entries.values(), values[3:]):
+        self._update_summary()
+        values = (
+            str(row.amount), row.payment_date.isoformat(),
+            row.payment.method if row.payment else "",
+            row.payment.status if row.payment else row.status,
+        )
+        for entry, value in zip(self.entries.values(), values):
             entry.delete(0, END)
             entry.insert(0, value)
 
 
 class MaintenanceScreen(BaseScreen):
-    """Read-only maintenance screen using dbo.mantenimiento and dbo.proveedor."""
+    """Maintenance management and quarterly scheduling."""
 
     def __init__(self, master: ctk.CTkBaseClass, db: DatabaseManager) -> None:
         super().__init__(master, db, "Mantenimientos")
-        ctk.CTkButton(self, text="Actualizar", width=120, command=self.refresh).pack(
-            anchor="w", padx=24, pady=(0, 12)
-        )
+        self.selected_id: int | None = None
+        self.original_status: str | None = None
+        self.vehicles: dict[str, tuple[int, int]] = {}
+        self.providers: dict[str, int] = {}
+        self.plates: dict[int, list[str]] = {}
+        self.table_rows: dict[str, tuple[object, ...]] = {}
+        self.entries: dict[str, ctk.CTkEntry] = {}
+        self._build_form()
+        summary = ctk.CTkFrame(self)
+        summary.pack(fill="x", padx=24, pady=(0, 12))
+        self.summary_label = ctk.CTkLabel(summary, text="Total proyectado anual: —", anchor="w")
+        self.summary_label.pack(fill="x", padx=12, pady=10)
         self.table = DataTable(self)
         self.table.pack(fill="both", expand=True, padx=24, pady=(0, 24))
+        self.table.tree.bind("<<TreeviewSelect>>", self._select_row)
         self.refresh()
+
+    def _build_form(self) -> None:
+        form = ctk.CTkFrame(self)
+        form.pack(fill="x", padx=24, pady=(0, 12))
+        ctk.CTkLabel(form, text="Vehículo").grid(row=0, column=0, padx=10, pady=(10, 2), sticky="w")
+        self.vehicle_combo = ctk.CTkComboBox(form, width=190, values=[], command=self._vehicle_changed)
+        self.vehicle_combo.grid(row=1, column=0, padx=10, pady=(0, 8))
+        self.vehicle_combo.set("")
+        ctk.CTkLabel(form, text="Placa(s) asociada(s)").grid(row=0, column=1, padx=10, pady=(10, 2), sticky="w")
+        self.plate_var = ctk.StringVar(value="Sin placa")
+        ctk.CTkEntry(form, width=190, textvariable=self.plate_var, state="readonly").grid(
+            row=1, column=1, padx=10, pady=(0, 8)
+        )
+        ctk.CTkLabel(form, text="Proveedor").grid(row=0, column=2, padx=10, pady=(10, 2), sticky="w")
+        self.provider_combo = ctk.CTkComboBox(form, width=190, values=[])
+        self.provider_combo.grid(row=1, column=2, padx=10, pady=(0, 8))
+        self.provider_combo.set("")
+        for index, (key, label) in enumerate([
+            ("tipo_servicio", "Tipo de servicio"), ("fecha", "Fecha (AAAA-MM-DD)"),
+            ("costo", "Costo"), ("kilometraje", "Kilometraje"),
+        ]):
+            column = index % 4
+            ctk.CTkLabel(form, text=label).grid(row=2, column=column, padx=10, pady=(5, 2), sticky="w")
+            entry = ctk.CTkEntry(form, width=190)
+            entry.grid(row=3, column=column, padx=10, pady=(0, 8))
+            self.entries[key] = entry
+        self.entries["costo"].bind("<KeyRelease>", self._update_summary)
+        ctk.CTkLabel(form, text="Estado").grid(row=0, column=3, padx=10, pady=(10, 2), sticky="w")
+        self.status_combo = ctk.CTkComboBox(form, width=190, values=["Programado", "En Proceso", "Finalizado"])
+        self.status_combo.grid(row=1, column=3, padx=10, pady=(0, 8))
+        self.status_combo.set("Programado")
+        buttons = ctk.CTkFrame(form, fg_color="transparent")
+        buttons.grid(row=4, column=0, columnspan=4, pady=8)
+        for text, command in [
+            ("Nuevo", self.handle_nuevo), ("Guardar", self.save), ("Actualizar", self.update),
+            ("Eliminar", self.delete), ("Buscar", self.search), ("Mostrar Todos", self.show_all),
+        ]:
+            ctk.CTkButton(buttons, text=text, width=110, command=command).pack(side="left", padx=4)
+
+    def _load_lookups(self) -> None:
+        _, vehicle_rows = self.db.select(
+            "SELECT vehiculo_id,marca,modelo,kilometraje_actual FROM dbo.vehiculo ORDER BY vehiculo_id"
+        )
+        _, provider_rows = self.db.select(
+            "SELECT proveedor_id,nombre_empresa FROM dbo.proveedor ORDER BY proveedor_id"
+        )
+        _, plate_rows = self.db.select(
+            """SELECT c.vehiculo_id,ma.numero_placa
+               FROM dbo.contrato_leasing c JOIN dbo.matricula ma ON ma.contrato_id=c.contrato_id
+               ORDER BY c.vehiculo_id,ma.numero_placa"""
+        )
+        self.vehicles = {
+            f"{row[0]} - {row[1]} {row[2]}": (int(row[0]), int(row[3])) for row in vehicle_rows
+        }
+        self.providers = {f"{row[0]} - {row[1]}": int(row[0]) for row in provider_rows}
+        self.plates = {}
+        for vehicle_id, plate in plate_rows:
+            plates = self.plates.setdefault(int(vehicle_id), [])
+            if str(plate) not in plates:
+                plates.append(str(plate))
+        self.vehicle_combo.configure(values=list(self.vehicles))
+        self.provider_combo.configure(values=list(self.providers))
+        self._show_plates()
+
+    def _show_plates(self) -> None:
+        vehicle = self.vehicles.get(self.vehicle_combo.get())
+        self.plate_var.set(", ".join(self.plates.get(vehicle[0], [])) if vehicle and self.plates.get(vehicle[0]) else "Sin placa")
+
+    def _vehicle_changed(self, value: str) -> None:
+        self._show_plates()
+        vehicle = self.vehicles.get(value)
+        if vehicle:
+            self.entries["kilometraje"].delete(0, END)
+            self.entries["kilometraje"].insert(0, str(vehicle[1]))
+
+    def _update_summary(self, _event: object = None) -> None:
+        try:
+            amount = Decimal(self.entries["costo"].get().strip())
+            if not amount.is_finite() or amount < 0:
+                raise ValueError
+            text = f"Total proyectado anual (costo × 4): S/ {amount * 4:,.2f}"
+        except (InvalidOperation, ValueError):
+            text = "Total proyectado anual: ingrese un costo válido."
+        self.summary_label.configure(text=text)
+
+    def handle_nuevo(self) -> None:
+        if self.selected_id is None and self._has_input():
+            self.save()
+        else:
+            self.new_record()
+
+    def _has_input(self) -> bool:
+        return bool(
+            self.vehicle_combo.get().strip()
+            or self.provider_combo.get().strip()
+            or any(entry.get().strip() for entry in self.entries.values())
+        )
+
+    def new_record(self) -> None:
+        self.selected_id = None
+        self.original_status = None
+        if self.table.tree.selection():
+            self.table.tree.selection_remove(*self.table.tree.selection())
+        self.vehicle_combo.set("")
+        self.provider_combo.set("")
+        self.status_combo.set("Programado")
+        self._show_plates()
+        for entry in self.entries.values():
+            entry.delete(0, END)
+        self._update_summary()
+
+    def _form_values(self) -> tuple[int, int, str, date, Decimal, int, str]:
+        vehicle = self.vehicles.get(self.vehicle_combo.get().strip())
+        provider = self.providers.get(self.provider_combo.get().strip())
+        if vehicle is None or provider is None:
+            raise ValueError("Seleccione un vehículo y un proveedor válidos.")
+        service = self.entries["tipo_servicio"].get().strip()
+        if not service or len(service) > 40:
+            raise ValueError("Ingrese un tipo de servicio de hasta 40 caracteres.")
+        date_text = self.entries["fecha"].get().strip()
+        if not date_text:
+            maintenance_date = date.today()
+        else:
+            try:
+                maintenance_date = date.fromisoformat(date_text)
+            except ValueError:
+                try:
+                    maintenance_date = datetime.strptime(date_text, "%d/%m/%Y").date()
+                except ValueError:
+                    raise ValueError("Ingrese una fecha válida en formato AAAA-MM-DD o DD/MM/AAAA.")
+        cost_text = self.entries["costo"].get().strip().replace("S/", "").replace("s/", "").replace(",", "").strip()
+        try:
+            cost = Decimal(cost_text)
+            if not cost.is_finite() or cost < 0 or cost >= Decimal("100000000") or cost.as_tuple().exponent < -2:
+                raise ValueError
+        except (ValueError, InvalidOperation):
+            raise ValueError("Ingrese un costo numérico válido (ej. 120.00).")
+        mileage_text = self.entries["kilometraje"].get().strip().replace(",", "").strip()
+        if not mileage_text:
+            mileage = vehicle[1]
+        else:
+            try:
+                mileage = int(mileage_text)
+                if mileage < 0 or mileage > 2147483647:
+                    raise ValueError
+            except ValueError:
+                raise ValueError("Ingrese un kilometraje entero no negativo.")
+        status = self.status_combo.get().strip() or "Programado"
+        if status.casefold() not in {"programado", "en proceso", "finalizado"} and status != self.original_status:
+            raise ValueError("Seleccione un estado válido.")
+        return vehicle[0], provider, service, maintenance_date, cost, mileage, status
+
+    def save(self) -> None:
+        try:
+            vehicle, provider, service, start, cost, mileage, _status = self._form_values()
+            dates = quarterly_dates(start)
+            parameters = tuple(
+                value for scheduled in dates
+                for value in (vehicle, provider, scheduled, service, cost, mileage, "Programado")
+            )
+            self.db.insert(
+                """INSERT INTO dbo.mantenimiento
+                   (vehiculo_id,proveedor_id,fecha,tipo_servicio,costo,kilometraje,estado)
+                   VALUES (?,?,?,?,?,?,?),(?,?,?,?,?,?,?),(?,?,?,?,?,?,?),(?,?,?,?,?,?,?)""",
+                parameters,
+            )
+            self.refresh()
+            self.new_record()
+            self.info("Mantenimiento registrado con éxito. Se generaron las 4 fechas programadas para el año.")
+        except (DatabaseError, ValueError) as exc:
+            self.error(exc)
+
+    def update(self) -> None:
+        if self.selected_id is None:
+            self.info("Seleccione un mantenimiento en la tabla.")
+            return
+        try:
+            vehicle, provider, service, maintenance_date, cost, mileage, status = self._form_values()
+            self.db.update(
+                """UPDATE dbo.mantenimiento SET vehiculo_id=?,proveedor_id=?,fecha=?,
+                   tipo_servicio=?,costo=?,kilometraje=?,estado=? WHERE mantenimiento_id=?""",
+                (vehicle, provider, maintenance_date, service, cost, mileage, status, self.selected_id),
+            )
+            self.refresh()
+            self.info("Mantenimiento actualizado exitosamente.")
+        except (DatabaseError, ValueError) as exc:
+            self.error(exc)
+
+    def delete(self) -> None:
+        if self.selected_id is None:
+            self.info("Seleccione un mantenimiento en la tabla.")
+            return
+        try:
+            self.db.delete("DELETE FROM dbo.mantenimiento WHERE mantenimiento_id=?", (self.selected_id,))
+            self.refresh()
+            self.new_record()
+            self.info("Mantenimiento eliminado exitosamente.")
+        except DatabaseError as exc:
+            self.error(exc)
+
+    def _load_rows(self) -> list[tuple[object, ...]]:
+        _, rows = self.db.select(
+            """SELECT m.mantenimiento_id,m.vehiculo_id,m.proveedor_id,
+                      CONCAT(v.marca,' ',v.modelo),pr.nombre_empresa,m.tipo_servicio,
+                      m.fecha,m.costo,m.kilometraje,m.estado
+               FROM dbo.mantenimiento m JOIN dbo.vehiculo v ON v.vehiculo_id=m.vehiculo_id
+               JOIN dbo.proveedor pr ON pr.proveedor_id=m.proveedor_id
+               ORDER BY m.fecha DESC,m.mantenimiento_id DESC"""
+        )
+        return rows
+
+    def _display_rows(self, rows: list[tuple[object, ...]]) -> None:
+        self.selected_id = None
+        self.original_status = None
+        self.table.set_rows(
+            ["vehiculo", "placa", "proveedor", "tipo_servicio", "fecha", "costo", "estado"],
+            [
+                (
+                    row[3],
+                    ", ".join(self.plates.get(int(row[1]), [])) or "Sin placa",
+                    row[4],
+                    row[5],
+                    row[6].strftime("%d/%m/%Y") if hasattr(row[6], "strftime") else str(row[6]),
+                    f"S/ {row[7]:,.2f}",
+                    row[9],
+                )
+                for row in rows
+            ],
+        )
+        self.table_rows = dict(zip(self.table.tree.get_children(), rows))
 
     def refresh(self) -> None:
         try:
-            columns, rows = self.db.select(
-                """SELECT m.mantenimiento_id,CONCAT(v.marca,' ',v.modelo) AS vehiculo,
-                   pr.nombre_empresa AS proveedor,m.tipo_servicio,m.fecha,m.costo,m.estado
-                   FROM dbo.mantenimiento m JOIN dbo.vehiculo v ON v.vehiculo_id=m.vehiculo_id
-                   JOIN dbo.proveedor pr ON pr.proveedor_id=m.proveedor_id ORDER BY m.fecha DESC"""
-            )
-            self.table.set_rows(columns, rows)
+            self._load_lookups()
+            self._display_rows(self._load_rows())
         except DatabaseError as exc:
             self.error(exc)
+
+    def search(self) -> None:
+        try:
+            vehicle_text = self.vehicle_combo.get().strip()
+            provider_text = self.provider_combo.get().strip()
+            if vehicle_text and vehicle_text not in self.vehicles:
+                raise ValueError("Seleccione un vehículo válido.")
+            if provider_text and provider_text not in self.providers:
+                raise ValueError("Seleccione un proveedor válido.")
+            filters = {key: entry.get().strip() for key, entry in self.entries.items()}
+            try:
+                selected_date = None
+                if filters["fecha"]:
+                    try:
+                        selected_date = date.fromisoformat(filters["fecha"])
+                    except ValueError:
+                        selected_date = datetime.strptime(filters["fecha"], "%d/%m/%Y").date()
+                cost_text = filters["costo"].replace("S/", "").replace("s/", "").replace(",", "").strip()
+                cost = Decimal(cost_text) if cost_text else None
+                mileage_text = filters["kilometraje"].replace(",", "").strip()
+                mileage = int(mileage_text) if mileage_text else None
+                if cost is not None and not cost.is_finite():
+                    raise ValueError
+            except (ValueError, InvalidOperation):
+                raise ValueError("Ingrese una fecha válida (AAAA-MM-DD o DD/MM/AAAA), costo y kilometraje válidos.")
+            status = self.status_combo.get().strip().casefold()
+            rows = [
+                row for row in self._load_rows()
+                if (not vehicle_text or row[1] == self.vehicles[vehicle_text][0])
+                and (not provider_text or row[2] == self.providers[provider_text])
+                and (not filters["tipo_servicio"] or filters["tipo_servicio"].casefold() in str(row[5]).casefold())
+                and (selected_date is None or row[6] == selected_date)
+                and (cost is None or row[7] == cost)
+                and (mileage is None or row[8] == mileage)
+                and (not status or status in str(row[9]).casefold())
+            ]
+            self._display_rows(rows)
+            if not rows:
+                self.info("No se encontraron mantenimientos.")
+        except (DatabaseError, ValueError) as exc:
+            self.error(exc)
+
+    def show_all(self) -> None:
+        self.new_record()
+        self.status_combo.set("")
+        self.refresh()
+
+    def _select_row(self, _event: object) -> None:
+        selection = self.table.tree.selection()
+        row = self.table_rows.get(selection[0]) if selection else None
+        if row is None:
+            return
+        self.selected_id = int(row[0])
+        self.original_status = str(row[9])
+        self.vehicle_combo.set(next((name for name, value in self.vehicles.items() if value[0] == row[1]), ""))
+        self.provider_combo.set(next((name for name, value in self.providers.items() if value == row[2]), ""))
+        self.status_combo.set(self.original_status)
+        self._show_plates()
+        fecha_str = row[6].strftime("%d/%m/%Y") if hasattr(row[6], "strftime") else str(row[6])
+        for key, value in zip(("tipo_servicio", "fecha", "costo", "kilometraje"), (row[5], fecha_str, row[7], row[8])):
+            self.entries[key].delete(0, END)
+            self.entries[key].insert(0, str(value))
+        self._update_summary()
 
 
 class ReportsScreen(BaseScreen):
