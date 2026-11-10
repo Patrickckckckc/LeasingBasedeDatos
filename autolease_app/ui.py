@@ -27,11 +27,11 @@ class DataTable(ctk.CTkFrame):
     @staticmethod
     def _column_alignment(column_name: str) -> str:
         col = column_name.lower()
-        if any(term in col for term in ("monto", "precio", "costo", "cuota", "total", "cantidad", "kilometraje", "salario")):
+        if any(term in col for term in ("monto", "precio", "costo", "cuota", "total", "cantidad", "kilometraje", "salario", "saldo")):
             return "e"
         if any(col == term or col.endswith(f"_{term}") for term in ("id", "dni", "ruc", "anio", "estado")):
             return "center"
-        if "fecha" in col:
+        if "fecha" in col or "estado" in col:
             return "center"
         return "w"
 
@@ -59,7 +59,11 @@ class DataTable(ctk.CTkFrame):
             self.tree.column(column, width=calc_width, minwidth=75, anchor=align)
 
         for row in rows:
-            self.tree.insert("", END, values=[str(value) if value is not None else "" for value in row])
+            formatted_row = [
+                "-" if value is None or str(value).strip() == "" else str(value)
+                for value in row
+            ]
+            self.tree.insert("", END, values=formatted_row)
 
     def _sort_by_column(self, col: str, reverse: bool) -> None:
         items = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
@@ -83,7 +87,7 @@ class DataTable(ctk.CTkFrame):
         selected = self.tree.selection()
         if not selected:
             return None
-        return tuple(str(value) for value in self.tree.item(selected[0], "values"))
+        return tuple("" if str(value) == "-" else str(value) for value in self.tree.item(selected[0], "values"))
 
 
 class BaseScreen(ctk.CTkFrame):
@@ -847,6 +851,33 @@ class ReportsScreen(BaseScreen):
     def __init__(self, master: ctk.CTkBaseClass, db: DatabaseManager) -> None:
         super().__init__(master, db, "Reportes del Sistema")
         self.report_configs: dict[str, dict[str, str]] = {
+            "Resumen de Pagos": {
+                "query": """SELECT c.contrato_id,
+                                   COALESCE(cl.nombre, 'Sin cliente asignado') AS cliente,
+                                   COALESCE(cl.dni, '-') AS dni,
+                                   CONCAT(v.marca, ' ', v.modelo) AS vehiculo,
+                                   c.cuota_mensual,
+                                   rp.cantidad_pagos,
+                                   rp.total_pagado,
+                                   CASE 
+                                       WHEN (c.cuota_mensual * NULLIF(DATEDIFF(month, c.fecha_inicio, c.fecha_fin), 0)) > rp.total_pagado 
+                                       THEN (c.cuota_mensual * DATEDIFF(month, c.fecha_inicio, c.fecha_fin)) - rp.total_pagado 
+                                       ELSE 0 
+                                   END AS saldo_pendiente,
+                                   CASE 
+                                       WHEN rp.cantidad_pagos = 0 THEN 'Sin pagos'
+                                       WHEN rp.total_pagado >= (c.cuota_mensual * DATEDIFF(month, c.fecha_inicio, c.fecha_fin)) THEN 'Completado'
+                                       ELSE 'En curso'
+                                   END AS estado_pago,
+                                   c.fecha_inicio,
+                                   c.fecha_fin
+                            FROM dbo.vw_resumen_pagos rp
+                            JOIN dbo.contrato_leasing c ON c.contrato_id = rp.contrato_id
+                            LEFT JOIN dbo.cliente cl ON cl.cliente_id = c.cliente_id
+                            LEFT JOIN dbo.vehiculo v ON v.vehiculo_id = c.vehiculo_id
+                            ORDER BY c.contrato_id""",
+                "type": "resumen_pagos",
+            },
             "Resumen Consolidado de Pagos y Clientes": {
                 "query": """SELECT cl.nombre AS cliente, cl.dni, c.contrato_id,
                                    c.cuota_mensual, rp.cantidad_pagos, rp.total_pagado,
@@ -856,10 +887,6 @@ class ReportsScreen(BaseScreen):
                             JOIN dbo.cliente cl ON cl.cliente_id = c.cliente_id
                             ORDER BY cl.nombre, c.contrato_id""",
                 "type": "consolidado",
-            },
-            "Resumen de Pagos": {
-                "query": "SELECT * FROM dbo.vw_resumen_pagos ORDER BY contrato_id",
-                "type": "resumen_pagos",
             },
             "Clientes y sus Contratos": {
                 "query": "SELECT * FROM dbo.vw_clientes_contratos ORDER BY cliente, contrato_id",
@@ -875,13 +902,13 @@ class ReportsScreen(BaseScreen):
             },
         }
         self.report_views = {
-            "Reporte de Seguros de Vehículos": "vw_vehiculos_seguros",
             "Resumen de Pagos": "vw_resumen_pagos",
+            "Reporte de Seguros de Vehículos": "vw_vehiculos_seguros",
             "Clientes y sus Contratos": "vw_clientes_contratos",
             "Historial de Mantenimientos": "vw_historial_mantenimiento",
             "Resumen Consolidado de Pagos y Clientes": "vw_resumen_pagos",
         }
-        self.report_name = ctk.StringVar(value="Resumen Consolidado de Pagos y Clientes")
+        self.report_name = ctk.StringVar(value="Resumen de Pagos")
         self.search_var = ctk.StringVar()
         self.search_var.trace_add("write", lambda *_: self._apply_filter())
 
@@ -1017,25 +1044,28 @@ class ReportsScreen(BaseScreen):
 
         count = len(rows)
 
-        if rtype == "consolidado":
-            unique_clients = len({row[0] for row in rows if row and row[0]})
+        if rtype == "resumen_pagos":
+            # Columns: contrato_id, cliente, dni, vehiculo, cuota_mensual, cantidad_pagos, total_pagado, saldo_pendiente, estado_pago, fecha_inicio, fecha_fin
+            total_pagos = sum(_to_int(row[5]) for row in rows if len(row) > 5)
+            total_recaudado = sum(_to_float(row[6]) for row in rows if len(row) > 6)
+            con_pagos = sum(1 for row in rows if len(row) > 5 and _to_int(row[5]) > 0)
+            sin_pagos = count - con_pagos
+            cards_data = [
+                ("Total Contratos", f"{count}"),
+                ("Total Recaudado", f"S/ {total_recaudado:,.2f}"),
+                ("Con Pagos Registrados", f"{con_pagos} contratos ({total_pagos} pagos)"),
+                ("Sin Pagos (Vacíos / Pend.)", f"{sin_pagos} contratos"),
+            ]
+        elif rtype == "consolidado":
+            unique_clients = len({row[0] for row in rows if row and row[0] and row[0] != "-"})
             total_pagos = sum(_to_int(row[4]) for row in rows if len(row) > 4)
             total_recaudado = sum(_to_float(row[5]) for row in rows if len(row) > 5)
+            sin_pagos = sum(1 for row in rows if len(row) > 4 and _to_int(row[4]) == 0)
             cards_data = [
                 ("Contratos Asociados", f"{count}"),
                 ("Clientes Únicos", f"{unique_clients}"),
                 ("Total Recaudado", f"S/ {total_recaudado:,.2f}"),
-                ("Total Pagos Realizados", f"{total_pagos}"),
-            ]
-        elif rtype == "resumen_pagos":
-            total_pagos = sum(_to_int(row[1]) for row in rows if len(row) > 1)
-            total_recaudado = sum(_to_float(row[2]) for row in rows if len(row) > 2)
-            promedio = (total_recaudado / count) if count > 0 else 0.0
-            cards_data = [
-                ("Contratos con Resumen", f"{count}"),
-                ("Total Pagos Recibidos", f"{total_pagos}"),
-                ("Monto Total Recaudado", f"S/ {total_recaudado:,.2f}"),
-                ("Promedio por Contrato", f"S/ {promedio:,.2f}"),
+                ("Contratos Sin Pagos", f"{sin_pagos}"),
             ]
         elif rtype == "clientes_contratos":
             unique_clients = len({row[0] for row in rows if row and row[0]})
