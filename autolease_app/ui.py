@@ -345,6 +345,7 @@ class VehicleScreen(BaseScreen):
         super().__init__(master, db, "Gestión de vehículos")
         self.selected_id: int | None = None
         self.entries: dict[str, ctk.CTkEntry] = {}
+        self.status_combo: ctk.CTkComboBox
         self._build_form()
         self.table = DataTable(self)
         self.table.pack(fill="both", expand=True, padx=24, pady=(0, 24))
@@ -357,12 +358,18 @@ class VehicleScreen(BaseScreen):
         fields = [("marca", "Marca"), ("modelo", "Modelo"), ("anio", "Año"),
                   ("precio", "Precio"), ("color", "Color"), ("kilometraje_actual", "Kilometraje Actual")]
         for index, (key, label) in enumerate(fields):
-            ctk.CTkLabel(form, text=label).grid(row=index // 3 * 2, column=index % 3, padx=10, pady=(10, 2), sticky="w")
+            row = (index // 3) * 2
+            col = index % 3
+            ctk.CTkLabel(form, text=label).grid(row=row, column=col, padx=10, pady=(10, 2), sticky="w")
             entry = ctk.CTkEntry(form, width=190)
-            entry.grid(row=index // 3 * 2 + 1, column=index % 3, padx=10, pady=(0, 8))
+            entry.grid(row=row + 1, column=col, padx=10, pady=(0, 8))
             self.entries[key] = entry
+        ctk.CTkLabel(form, text="Estado").grid(row=0, column=3, padx=10, pady=(10, 2), sticky="w")
+        self.status_combo = ctk.CTkComboBox(form, width=190, values=["Disponible", "Ocupado", "Arrendado"])
+        self.status_combo.grid(row=1, column=3, padx=10, pady=(0, 8))
+        self.status_combo.set("Disponible")
         buttons = ctk.CTkFrame(form, fg_color="transparent")
-        buttons.grid(row=4, column=0, columnspan=3, pady=8)
+        buttons.grid(row=4, column=0, columnspan=4, pady=8)
         for text, command in [("Nuevo", self.new_record), ("Guardar", self.save),
                               ("Actualizar", self.update), ("Eliminar", self.delete),
                               ("Buscar", self.search), ("Mostrar todos", self.show_all)]:
@@ -372,16 +379,19 @@ class VehicleScreen(BaseScreen):
         self.selected_id = None
         for entry in self.entries.values():
             entry.delete(0, END)
+        self.status_combo.set("Disponible")
 
     def values(self) -> tuple[str, ...]:
-        return tuple(entry.get().strip() for entry in self.entries.values())
+        return tuple(entry.get().strip() for entry in self.entries.values()) + (
+            self.status_combo.get().strip() or "Disponible",
+        )
 
     def save(self) -> None:
         try:
             self.db.insert(
                 """INSERT INTO dbo.vehiculo
-                   (marca,modelo,anio,precio,color,kilometraje_actual)
-                   VALUES (?,?,?,?,?,?)""", self.values()
+                   (marca,modelo,anio,precio,color,kilometraje_actual,estado)
+                   VALUES (?,?,?,?,?,?,?)""", self.values()
             )
             self.refresh()
             self.new_record()
@@ -395,7 +405,7 @@ class VehicleScreen(BaseScreen):
         try:
             self.db.update(
                 """UPDATE dbo.vehiculo SET marca=?,modelo=?,anio=?,precio=?,color=?,
-                   kilometraje_actual=? WHERE vehiculo_id=?""",
+                   kilometraje_actual=?,estado=? WHERE vehiculo_id=?""",
                 self.values() + (self.selected_id,),
             )
             self.refresh()
@@ -425,7 +435,7 @@ class VehicleScreen(BaseScreen):
     def refresh(self) -> None:
         try:
             columns, rows = self.db.select(
-                """SELECT vehiculo_id,marca,modelo,anio,precio,color,kilometraje_actual
+                """SELECT vehiculo_id,marca,modelo,anio,precio,color,kilometraje_actual,estado
                    FROM dbo.vehiculo ORDER BY vehiculo_id"""
             )
             self.table.set_rows(columns, rows)
@@ -441,7 +451,7 @@ class VehicleScreen(BaseScreen):
             ("color", "Color"),
             ("kilometraje_actual", "Kilometraje Actual"),
         )
-        values = self.values()
+        values = tuple(entry.get().strip() for entry in self.entries.values())
         conditions = []
         parameters: list[str] = []
         for (column, _label), value in zip(filter_fields, values):
@@ -454,7 +464,12 @@ class VehicleScreen(BaseScreen):
                 conditions.append(f"{searchable_column} LIKE ?")
                 parameters.append(f"%{value}%")
 
-        query = """SELECT vehiculo_id,marca,modelo,anio,precio,color,kilometraje_actual
+        status_value = self.status_combo.get().strip()
+        if status_value:
+            conditions.append("estado LIKE ?")
+            parameters.append(f"%{status_value}%")
+
+        query = """SELECT vehiculo_id,marca,modelo,anio,precio,color,kilometraje_actual,estado
                    FROM dbo.vehiculo"""
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
@@ -470,6 +485,7 @@ class VehicleScreen(BaseScreen):
 
     def show_all(self) -> None:
         self.new_record()
+        self.status_combo.set("")
         self.refresh()
 
 
@@ -478,9 +494,11 @@ class VehicleScreen(BaseScreen):
         if not values:
             return
         self.selected_id = int(values[0])
-        for entry, value in zip(self.entries.values(), values[1:]):
+        for entry, value in zip(self.entries.values(), values[1:7]):
             entry.delete(0, END)
             entry.insert(0, value)
+        if len(values) > 7:
+            self.status_combo.set(values[7])
 
 
 class ContractScreen(BaseScreen):
